@@ -1,0 +1,476 @@
+// ============================================================================
+// FILE: Ballistics.cs
+// ============================================================================
+// Ballistics.cs — Unity 2022.3 LTS, C#
+// Projectile lead solver + ballistic arc. Pure math, no engine state.
+
+using UnityEngine;
+
+public static class Ballistics
+{
+    public static bool SolveVelocity(Vector3 origin, Vector3 target, float speed, float g,
+        out Vector3 velocity)
+    {
+        Vector3 toTarget = target - origin;
+        Vector3 flat = new Vector3(toTarget.x, 0f, toTarget.z);
+        float x = flat.magnitude;
+        float y = toTarget.y;
+
+        float speedSq = speed * speed;
+        float root = speedSq * speedSq - g * (g * x * x + 2f * y * speedSq);
+        if (root < 0f) { velocity = Vector3.zero; return false; }
+
+        float angle = Mathf.Atan2(speedSq - Mathf.Sqrt(root), g * x);
+        Vector3 dir = flat.normalized;
+        velocity = dir * (speed * Mathf.Cos(angle)) + Vector3.up * (speed * Mathf.Sin(angle));
+        return true;
+    }
+
+    public static Vector3 LeadTarget(Vector3 origin, Vector3 targetPos, Vector3 targetVel,
+        float projectileSpeed, float g, int iterations = 4)
+    {
+        Vector3 predicted = targetPos;
+        for (int i = 0; i < iterations; i++)
+        {
+            float t = Vector3.Distance(origin, predicted) / projectileSpeed;
+            predicted = targetPos + targetVel * t;
+            predicted.y -= 0.5f * g * t * t;
+        }
+        return predicted;
+    }
+
+    public static Vector3 ApplyRecoil(Vector3 aimDir, float verticalKick, float horizontalKick,
+        float decay, float dt)
+    {
+        Quaternion kick = Quaternion.Euler(-verticalKick, horizontalKick, 0f);
+        return Quaternion.Slerp(Quaternion.identity, kick, 1f - decay * dt) * aimDir;
+    }
+}
+
+// ============================================================================
+// FILE: AimTrainer.cs
+// ============================================================================
+// AimTrainer.cs — Unity 2022.3 LTS, C#
+// Target spawn manager, hit detection, accuracy/reaction scoring.
+
+using System.Collections.Generic;
+using UnityEngine;
+
+public class AimTrainer : MonoBehaviour
+{
+    [Header("Config")]
+    public GameObject targetPrefab;
+    public int maxTargets = 3;
+    public float spawnRadius = 12f;
+    public float targetLifetime = 2.5f;
+    public Camera aimCamera;
+
+    private readonly List<Target> _active = new List<Target>();
+    private int _hits;
+    private int _misses;
+    private float _lastSpawnTime;
+    private float _totalReactionTime;
+
+    public float Accuracy => (_hits + _misses) == 0 ? 0f : (float)_hits / (_hits + _misses);
+    public float AvgReaction => _hits == 0 ? 0f : _totalReactionTime / _hits;
+
+    private void Start()
+    {
+        if (aimCamera == null) aimCamera = Camera.main;
+        for (int i = 0; i < maxTargets; i++) SpawnTarget();
+    }
+
+    private void Update()
+    {
+        if (Input.GetMouseButtonDown(0)) TryHit();
+        if (_active.Count < maxTargets && Time.time - _lastSpawnTime > 0.15f) SpawnTarget();
+    }
+
+    private void SpawnTarget()
+    {
+        _lastSpawnTime = Time.time;
+        Vector2 c = Random.insideUnitCircle * spawnRadius;
+        GameObject go = Instantiate(targetPrefab, new Vector3(c.x, c.y, 0f), Quaternion.identity);
+        Target t = go.GetComponent<Target>();
+        if (t == null) t = go.AddComponent<Target>();
+        t.Init(this, targetLifetime);
+        _active.Add(t);
+    }
+
+    private void TryHit()
+    {
+        Ray ray = aimCamera.ScreenPointToRay(Input.mousePosition);
+        if (Physics.Raycast(ray, out RaycastHit hit, 100f))
+        {
+            Target t = hit.collider.GetComponent<Target>();
+            if (t != null) { _hits++; _totalReactionTime += t.Age; Remove(t); return; }
+        }
+        _misses++;
+    }
+
+    public void Remove(Target t)
+    {
+        _active.Remove(t);
+        if (t != null) Destroy(t.gameObject);
+    }
+
+    private void OnGUI()
+    {
+        GUI.Label(new Rect(10, 10, 400, 24),
+            $"Hits: {_hits}  Misses: {_misses}  Acc: {Accuracy:P1}  AvgReact: {AvgReaction:F2}s");
+    }
+}
+
+// ============================================================================
+// FILE: Target.cs
+// ============================================================================
+// Target.cs — Unity 2022.3 LTS, C#
+// Individual target: lifetime + age stamp for reaction tracking.
+
+using UnityEngine;
+
+public class Target : MonoBehaviour
+{
+    private AimTrainer _trainer;
+    private float _deathTime;
+    private float _spawnTime;
+
+    public float Age => Time.time - _spawnTime;
+
+    public void Init(AimTrainer trainer, float lifetime)
+    {
+        _trainer = trainer;
+        _spawnTime = Time.time;
+        _deathTime = Time.time + lifetime;
+    }
+
+    private void Update()
+    {
+        if (Time.time >= _deathTime && _trainer != null) _trainer.Remove(this);
+    }
+}
+
+// ============================================================================
+// FILE: ProjectilePool.cs
+// ============================================================================
+// ProjectilePool.cs — Unity 2022.3 LTS, C#
+// Pre-allocated projectile pool. No Instantiate/Destroy churn in hot path.
+
+using System.Collections.Generic;
+using UnityEngine;
+
+[DefaultExecutionOrder(-100)]
+public class ProjectilePool : MonoBehaviour
+{
+    [Header("Config")]
+    public GameObject projectilePrefab;
+    public int poolSize = 32;
+    public float projectileLifetime = 5f;
+
+    private readonly Queue<Projectile> _pool = new Queue<Projectile>();
+    private readonly List<Projectile> _live = new List<Projectile>();
+
+    public static ProjectilePool Instance { get; private set; }
+
+    private void Awake()
+    {
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+        Instance = this;
+
+        for (int i = 0; i < poolSize; i++)
+        {
+            GameObject go = Instantiate(projectilePrefab, transform);
+            Projectile p = go.GetComponent<Projectile>();
+            if (p == null) p = go.AddComponent<Projectile>();
+            p.Init(this, projectileLifetime);
+            go.SetActive(false);
+            _pool.Enqueue(p);
+        }
+    }
+
+    public Projectile Rent()
+    {
+        if (_pool.Count == 0)
+        {
+            GameObject go = Instantiate(projectilePrefab, transform);
+            Projectile p = go.GetComponent<Projectile>();
+            if (p == null) p = go.AddComponent<Projectile>();
+            p.Init(this, projectileLifetime);
+            _live.Add(p);
+            return p;
+        }
+        Projectile rented = _pool.Dequeue();
+        rented.gameObject.SetActive(true);
+        _live.Add(rented);
+        return rented;
+    }
+
+    public void Return(Projectile p)
+    {
+        if (p == null) return;
+        _live.Remove(p);
+        p.ResetState();
+        p.gameObject.SetActive(false);
+        _pool.Enqueue(p);
+    }
+}
+
+// ============================================================================
+// FILE: Projectile.cs
+// ============================================================================
+// Projectile.cs — Unity 2022.3 LTS, C#
+// Pooled projectile: self-returning, ballistic velocity, lifetime.
+
+using UnityEngine;
+
+[RequireComponent(typeof(Rigidbody))]
+public class Projectile : MonoBehaviour
+{
+    private Rigidbody _rb;
+    private ProjectilePool _pool;
+    private float _life;
+    private float _dieAt;
+
+    private void Awake()
+    {
+        _rb = GetComponent<Rigidbody>();
+        _rb.useGravity = true;
+        _rb.drag = 0f;
+    }
+
+    public void Init(ProjectilePool pool, float lifetime)
+    {
+        _pool = pool;
+        _life = lifetime;
+    }
+
+    public void Launch(Vector3 velocity)
+    {
+        _rb.velocity = velocity;
+        _dieAt = Time.time + _life;
+    }
+
+    public void ResetState()
+    {
+        _rb.velocity = Vector3.zero;
+        _rb.angularVelocity = Vector3.zero;
+    }
+
+    private void Update()
+    {
+        if (Time.time >= _dieAt && _pool != null) _pool.Return(this);
+    }
+
+    private void OnCollisionEnter(Collision c)
+    {
+        if (_pool != null) _pool.Return(this);
+    }
+}
+
+// ============================================================================
+// FILE: BotAI.cs
+// ============================================================================
+// BotAI.cs — Unity 2022.3 LTS, C#
+// FSM bot with ballistics lead solver. Patrol → Chase → Attack → Fire.
+
+using UnityEngine;
+
+[RequireComponent(typeof(CharacterController))]
+public class BotAI : MonoBehaviour
+{
+    public enum State { Patrol, Chase, Attack }
+
+    [Header("Config")]
+    public Transform player;
+    public Transform muzzle;
+    public MuzzleFlash muzzleFlash;
+    public float sightRange = 20f;
+    public float attackRange = 6f;
+    public float patrolSpeed = 2f;
+    public float chaseSpeed = 5f;
+    public float turnSpeed = 8f;
+    public float fireInterval = 0.8f;
+    public float projectileSpeed = 30f;
+    public float gravity = 9.81f;
+
+    private CharacterController _cc;
+    private CharacterController _playerCc;
+    private State _state = State.Patrol;
+    private Vector3 _patrolOrigin;
+    private Vector3 _patrolTarget;
+    private float _lastFire;
+
+    private void Awake()
+    {
+        _cc = GetComponent<CharacterController>();
+        _patrolOrigin = transform.position;
+        _patrolTarget = _patrolOrigin;
+        if (player != null) _playerCc = player.GetComponent<CharacterController>();
+    }
+
+    private void Update()
+    {
+        switch (_state)
+        {
+            case State.Patrol: TickPatrol(); break;
+            case State.Chase: TickChase(); break;
+            case State.Attack: TickAttack(); break;
+        }
+    }
+
+    private void TickPatrol()
+    {
+        if (Vector3.Distance(transform.position, _patrolTarget) < 1f)
+            _patrolTarget = _patrolOrigin + Random.insideUnitSphere * 10f;
+
+        MoveTowards(_patrolTarget, patrolSpeed);
+        if (DistanceToPlayer() < sightRange) _state = State.Chase;
+    }
+
+    private void TickChase()
+    {
+        float d = DistanceToPlayer();
+        if (d > sightRange * 1.2f) { _state = State.Patrol; return; }
+        if (d < attackRange) { _state = State.Attack; return; }
+        MoveTowards(player.position, chaseSpeed);
+    }
+
+    private void TickAttack()
+    {
+        FacePlayer();
+        if (DistanceToPlayer() > attackRange * 1.1f) { _state = State.Chase; return; }
+        if (Time.time - _lastFire < fireInterval) return;
+        _lastFire = Time.time;
+        Fire();
+    }
+
+    private void Fire()
+    {
+        if (player == null || muzzle == null) return;
+
+        Vector3 targetVel = _playerCc != null ? _playerCc.velocity : Vector3.zero;
+        targetVel.y = 0f;
+
+        Vector3 aimPoint = Ballistics.LeadTarget(
+            muzzle.position, player.position, targetVel, projectileSpeed, gravity);
+
+        if (!Ballistics.SolveVelocity(muzzle.position, aimPoint, projectileSpeed, gravity,
+            out Vector3 vel)) return;
+
+        ProjectilePool pool = ProjectilePool.Instance;
+        if (pool == null) return;
+
+        Projectile p = pool.Rent();
+        p.transform.position = muzzle.position;
+        p.transform.rotation = Quaternion.LookRotation(vel);
+        p.Launch(vel);
+
+        if (muzzleFlash != null) muzzleFlash.Flash();
+    }
+
+    private float DistanceToPlayer() => Vector3.Distance(transform.position, player.position);
+
+    private void MoveTowards(Vector3 target, float speed)
+    {
+        Vector3 dir = (target - transform.position).normalized;
+        dir.y = 0f;
+        _cc.SimpleMove(dir * speed);
+        if (dir.sqrMagnitude > 0.001f)
+            transform.rotation = Quaternion.Slerp(transform.rotation,
+                Quaternion.LookRotation(dir), turnSpeed * Time.deltaTime);
+    }
+
+    private void FacePlayer()
+    {
+        Vector3 dir = player.position - transform.position;
+        dir.y = 0f;
+        if (dir.sqrMagnitude > 0.001f)
+            transform.rotation = Quaternion.Slerp(transform.rotation,
+                Quaternion.LookRotation(dir), turnSpeed * Time.deltaTime);
+    }
+}
+
+// ============================================================================
+// FILE: FiringController.cs
+// ============================================================================
+// FiringController.cs — Unity 2022.3 LTS, C#
+// Player gun: pool-backed, ballistics-solved arc to hit point.
+
+using UnityEngine;
+
+public class FiringController : MonoBehaviour
+{
+    [Header("Config")]
+    public Transform muzzle;
+    public MuzzleFlash muzzleFlash;
+    public float projectileSpeed = 40f;
+    public float gravity = 9.81f;
+    public LayerMask hitMask;
+    public Camera aimCamera;
+
+    private void Start()
+    {
+        if (aimCamera == null) aimCamera = Camera.main;
+    }
+
+    private void Update()
+    {
+        if (!Input.GetMouseButtonDown(0)) return;
+
+        Ray ray = aimCamera.ScreenPointToRay(Input.mousePosition);
+        if (!Physics.Raycast(ray, out RaycastHit hit, 200f, hitMask)) return;
+
+        if (!Ballistics.SolveVelocity(muzzle.position, hit.point, projectileSpeed, gravity,
+            out Vector3 vel)) return;
+
+        ProjectilePool pool = ProjectilePool.Instance;
+        if (pool == null) return;
+
+        Projectile p = pool.Rent();
+        p.transform.position = muzzle.position;
+        p.transform.rotation = Quaternion.LookRotation(vel);
+        p.Launch(vel);
+
+        if (muzzleFlash != null) muzzleFlash.Flash();
+    }
+}
+
+// ============================================================================
+// FILE: MuzzleFlash.cs
+// ============================================================================
+// MuzzleFlash.cs — Unity 2022.3 LTS, C#
+// Flash + optional pooled one-shot audio. Attach to a Light on the muzzle.
+
+using UnityEngine;
+
+[RequireComponent(typeof(Light))]
+public class MuzzleFlash : MonoBehaviour
+{
+    public float duration = 0.05f;
+    public float intensity = 4f;
+    public AudioSource audioSource;
+    public AudioClip shotClip;
+    public ParticleSystem particles;
+
+    private Light _light;
+    private float _offAt;
+
+    private void Awake()
+    {
+        _light = GetComponent<Light>();
+        _light.intensity = 0f;
+    }
+
+    public void Flash()
+    {
+        _light.intensity = intensity;
+        _offAt = Time.time + duration;
+        if (particles != null) particles.Play();
+        if (audioSource != null && shotClip != null) audioSource.PlayOneShot(shotClip);
+    }
+
+    private void Update()
+    {
+        if (_light.intensity > 0f && Time.time >= _offAt) _light.intensity = 0f;
+    }
+}
